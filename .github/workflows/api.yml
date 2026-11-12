@@ -233,23 +233,35 @@ jobs:
         env:
           API_HOST: k8s-devsu-devsuapi-5e8a33efc3-1351564505.us-east-2.elb.amazonaws.com
         run: |
-          for attempt in $(seq 1 18); do
-            if curl --fail --silent --show-error "http://${API_HOST}/healthz/" \
-              --output "${RUNNER_TEMP}/healthz.json"; then
-              break
-            fi
-            if (( attempt == 18 )); then
-              echo "La prueba externa de /healthz/ agotó el tiempo." >&2
-              exit 1
-            fi
-            sleep 10
-          done
-          cat "${RUNNER_TEMP}/healthz.json"
-          jq --exit-status '.status == "ok"' "${RUNNER_TEMP}/healthz.json" >/dev/null
-          curl --fail --silent --show-error "http://${API_HOST}/api/users/" \
-            --output "${RUNNER_TEMP}/users.json"
-          cat "${RUNNER_TEMP}/users.json"
-          jq --exit-status 'type == "array"' "${RUNNER_TEMP}/users.json" >/dev/null
+          check_public_endpoint() {
+            local path="$1"
+            local jq_filter="$2"
+            local output_file="$3"
+
+            for attempt in $(seq 1 18); do
+              if curl --fail --silent --show-error --max-time 15 \
+                "http://${API_HOST}${path}" --output "${output_file}" && \
+                jq --exit-status "${jq_filter}" "${output_file}" >/dev/null; then
+                cat "${output_file}"
+                return 0
+              fi
+
+              echo "La ruta ${path} aún no pasó la prueba (intento ${attempt}/18)."
+              sleep 10
+            done
+
+            echo "La prueba externa de ${path} agotó el tiempo." >&2
+            return 1
+          }
+
+          check_public_endpoint \
+            "/healthz/" \
+            '.status == "ok"' \
+            "${RUNNER_TEMP}/healthz.json"
+          check_public_endpoint \
+            "/api/users/" \
+            'type == "array"' \
+            "${RUNNER_TEMP}/users.json"
 
       - name: Retirar la IP temporal del runner del endpoint EKS
         if: ${{ always() && steps.eks_runner_access.outputs.changed == 'true' }}

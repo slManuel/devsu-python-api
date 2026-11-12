@@ -2,6 +2,26 @@
 
 This is a simple application to be used in the technical test of DevOps.
 
+## Despliegue público en AWS
+
+La API está publicada en AWS EKS y puede probarse desde Internet sin iniciar sesión. El endpoint usa HTTP para esta demostración.
+
+- Repositorio de la API: https://github.com/slManuel/devsu-python-api
+- Repositorio de infraestructura Terraform: https://github.com/slManuel/devsu-aws-infrastructure
+- URL pública base: http://k8s-devsu-devsuapi-5e8a33efc3-1351564505.us-east-2.elb.amazonaws.com
+- Workflow CI/CD de la API: https://github.com/slManuel/devsu-python-api/actions/workflows/api.yml
+
+Prueba rápida desde una terminal con `curl`:
+
+```bash
+curl -i http://k8s-devsu-devsuapi-5e8a33efc3-1351564505.us-east-2.elb.amazonaws.com/healthz/
+curl -i http://k8s-devsu-devsuapi-5e8a33efc3-1351564505.us-east-2.elb.amazonaws.com/api/users/
+```
+
+La primera ruta debe devolver HTTP 200 y `{"status":"ok"}`. La segunda devuelve HTTP 200 y una lista JSON de usuarios; si aún no se han creado usuarios, devuelve `[]`.
+
+La URL la publica el Ingress de Kubernetes mediante un Application Load Balancer. Los cambios de la aplicación se construyen, escanean, publican en Amazon ECR y despliegan en EKS desde GitHub Actions al actualizar `main`.
+
 ## Getting Started
 
 ### Prerequisites
