@@ -17,6 +17,10 @@ env:
   DJANGO_DEBUG: "false"
   DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
 
+concurrency:
+  group: devsu-dev-api-deployment
+  cancel-in-progress: false
+
 jobs:
   validate:
     name: Pruebas, calidad y escaneo de imagen
@@ -126,3 +130,248 @@ jobs:
           aws ecr get-login-password --region "${AWS_REGION}" \
             | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
           docker push "${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+
+  deploy:
+    name: Desplegar en Amazon EKS
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.AWS_ROLE_ARN != '' &&
+      vars.ECR_REPOSITORY_URI != ''
+    needs: [validate, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 45
+    steps:
+      - name: Obtener el código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Obtener credenciales temporales de AWS con OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: api-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Instalar kubectl y verificar su checksum
+        env:
+          KUBECTL_VERSION: "1.37.0"
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+            --output "${RUNNER_TEMP}/kubectl"
+          curl --fail --silent --show-error --location \
+            "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
+            --output "${RUNNER_TEMP}/kubectl.sha256"
+          echo "$(cat "${RUNNER_TEMP}/kubectl.sha256")  ${RUNNER_TEMP}/kubectl" \
+            | sha256sum --check --status
+          sudo install -m 0755 "${RUNNER_TEMP}/kubectl" /usr/local/bin/kubectl
+
+      - name: Autorizar temporalmente la IP del runner en EKS
+        id: eks_runner_access
+        env:
+          CLUSTER_NAME: devsu-dev-cluster
+        run: |
+          RUNNER_IP="$(curl --fail --silent --show-error --ipv4 https://checkip.amazonaws.com | tr -d '[:space:]')"
+          python -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "${RUNNER_IP}"
+          RUNNER_CIDR="${RUNNER_IP}/32"
+          echo "runner_cidr=${RUNNER_CIDR}" >> "${GITHUB_OUTPUT}"
+
+          CURRENT_CONFIG="$(aws eks describe-cluster \
+            --region "${AWS_REGION}" \
+            --name "${CLUSTER_NAME}" \
+            --query 'cluster.resourcesVpcConfig' \
+            --output json)"
+          CURRENT_CIDRS="$(jq -c '.publicAccessCidrs' <<< "${CURRENT_CONFIG}")"
+
+          if jq --exit-status --arg cidr "${RUNNER_CIDR}" 'index($cidr) != null' \
+            <<< "${CURRENT_CIDRS}" >/dev/null; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "La IP del runner ya estaba autorizada; no se cambiará la lista."
+            exit 0
+          fi
+
+          CIDR_COUNT="$(jq 'length' <<< "${CURRENT_CIDRS}")"
+          if (( CIDR_COUNT >= 40 )); then
+            echo "El límite de 40 CIDR públicos de EKS impediría agregar el runner." >&2
+            exit 1
+          fi
+
+          UPDATED_CIDRS="$(jq -c --arg cidr "${RUNNER_CIDR}" '. + [$cidr]' <<< "${CURRENT_CIDRS}")"
+          PUBLIC_ACCESS="$(jq -c '.endpointPublicAccess' <<< "${CURRENT_CONFIG}")"
+          PRIVATE_ACCESS="$(jq -c '.endpointPrivateAccess' <<< "${CURRENT_CONFIG}")"
+          UPDATE_CONFIG="$(jq -cn \
+            --argjson public "${PUBLIC_ACCESS}" \
+            --argjson private "${PRIVATE_ACCESS}" \
+            --argjson cidrs "${UPDATED_CIDRS}" \
+            '{endpointPublicAccess:$public,endpointPrivateAccess:$private,publicAccessCidrs:$cidrs}')"
+
+          # Marcar el cambio antes de solicitarlo para que el paso final intente limpiar
+          # incluso si AWS devuelve un error después de aceptar la operación.
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          UPDATE_ID="$(aws eks update-cluster-config \
+            --region "${AWS_REGION}" \
+            --name "${CLUSTER_NAME}" \
+            --resources-vpc-config "${UPDATE_CONFIG}" \
+            --query 'update.id' \
+            --output text)"
+          for attempt in $(seq 1 60); do
+            UPDATE_STATUS="$(aws eks describe-update \
+              --region "${AWS_REGION}" \
+              --name "${CLUSTER_NAME}" \
+              --update-id "${UPDATE_ID}" \
+              --query 'update.status' \
+              --output text)"
+            case "${UPDATE_STATUS}" in
+              Successful) break ;;
+              Failed|Cancelled)
+                aws eks describe-update \
+                  --region "${AWS_REGION}" \
+                  --name "${CLUSTER_NAME}" \
+                  --update-id "${UPDATE_ID}" \
+                  --query 'update.errors' \
+                  --output json >&2
+                exit 1
+                ;;
+            esac
+            if (( attempt == 60 )); then
+              echo "La autorización temporal del runner no terminó en diez minutos." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Conectar con el clúster EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name devsu-dev-cluster
+
+      - name: Comprobar recursos base del despliegue
+        run: |
+          kubectl auth can-i get deployments --namespace devsu
+          kubectl auth can-i patch deployments --namespace devsu
+          kubectl auth can-i create jobs --namespace devsu
+
+      - name: Preparar la imagen de este commit
+        env:
+          ECR_REPOSITORY_URI: ${{ vars.ECR_REPOSITORY_URI }}
+        run: |
+          IMAGE_TAG="git-${GITHUB_SHA}"
+          sed -i "s|newTag: .*|newTag: ${IMAGE_TAG}|" kubernetes/dev/kustomization.yaml
+          echo "IMAGE=${ECR_REPOSITORY_URI}:${IMAGE_TAG}" >> "${GITHUB_ENV}"
+          echo "JOB_NAME=devsu-api-migrate-${GITHUB_SHA::12}" >> "${GITHUB_ENV}"
+
+      - name: Aplicar configuración no sensible
+        run: kubectl apply --filename kubernetes/dev/configmap.yaml
+
+      - name: Migrar la base de datos
+        run: |
+          sed \
+            -e "s|__JOB_NAME__|${JOB_NAME}|g" \
+            -e "s|__IMAGE__|${IMAGE}|g" \
+            kubernetes/dev/migration-job.yaml \
+            | kubectl apply --filename -
+          kubectl wait \
+            --for=condition=complete \
+            --timeout=180s \
+            "job/${JOB_NAME}" \
+            --namespace devsu
+          kubectl logs "job/${JOB_NAME}" --namespace devsu
+
+      - name: Aplicar recursos de la API y esperar el rollout
+        run: |
+          kubectl apply --kustomize kubernetes/dev
+          kubectl rollout status deployment/devsu-api \
+            --namespace devsu \
+            --timeout=240s
+          kubectl get deployment,pods,ingress --namespace devsu --output wide
+
+      - name: Probar la API desde internet
+        env:
+          API_HOST: k8s-devsu-devsuapi-5e8a33efc3-1351564505.us-east-2.elb.amazonaws.com
+        run: |
+          for attempt in $(seq 1 18); do
+            if curl --fail --silent --show-error "http://${API_HOST}/healthz/" \
+              --output "${RUNNER_TEMP}/healthz.json"; then
+              break
+            fi
+            if (( attempt == 18 )); then
+              echo "La prueba externa de /healthz/ agotó el tiempo." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          cat "${RUNNER_TEMP}/healthz.json"
+          jq --exit-status '.status == "ok"' "${RUNNER_TEMP}/healthz.json" >/dev/null
+          curl --fail --silent --show-error "http://${API_HOST}/api/users/" \
+            --output "${RUNNER_TEMP}/users.json"
+          cat "${RUNNER_TEMP}/users.json"
+          jq --exit-status 'type == "array"' "${RUNNER_TEMP}/users.json" >/dev/null
+
+      - name: Retirar la IP temporal del runner del endpoint EKS
+        if: ${{ always() && steps.eks_runner_access.outputs.changed == 'true' }}
+        env:
+          CLUSTER_NAME: devsu-dev-cluster
+          RUNNER_CIDR: ${{ steps.eks_runner_access.outputs.runner_cidr }}
+        run: |
+          CURRENT_CONFIG="$(aws eks describe-cluster \
+            --region "${AWS_REGION}" \
+            --name "${CLUSTER_NAME}" \
+            --query 'cluster.resourcesVpcConfig' \
+            --output json)"
+          CURRENT_CIDRS="$(jq -c '.publicAccessCidrs' <<< "${CURRENT_CONFIG}")"
+          if ! jq --exit-status --arg cidr "${RUNNER_CIDR}" 'index($cidr) != null' \
+            <<< "${CURRENT_CIDRS}" >/dev/null; then
+            echo "La IP temporal ya no está autorizada; no se requiere limpieza."
+            exit 0
+          fi
+          RESTORED_CIDRS="$(jq -c --arg cidr "${RUNNER_CIDR}" '[.[] | select(. != $cidr)]' <<< "${CURRENT_CIDRS}")"
+
+          if [[ "${RESTORED_CIDRS}" == "[]" ]]; then
+            echo "Se cancela la limpieza: dejar el endpoint sin CIDR autorizado lo bloquearía." >&2
+            exit 1
+          fi
+
+          PUBLIC_ACCESS="$(jq -c '.endpointPublicAccess' <<< "${CURRENT_CONFIG}")"
+          PRIVATE_ACCESS="$(jq -c '.endpointPrivateAccess' <<< "${CURRENT_CONFIG}")"
+          UPDATE_CONFIG="$(jq -cn \
+            --argjson public "${PUBLIC_ACCESS}" \
+            --argjson private "${PRIVATE_ACCESS}" \
+            --argjson cidrs "${RESTORED_CIDRS}" \
+            '{endpointPublicAccess:$public,endpointPrivateAccess:$private,publicAccessCidrs:$cidrs}')"
+
+          UPDATE_ID="$(aws eks update-cluster-config \
+            --region "${AWS_REGION}" \
+            --name "${CLUSTER_NAME}" \
+            --resources-vpc-config "${UPDATE_CONFIG}" \
+            --query 'update.id' \
+            --output text)"
+          for attempt in $(seq 1 60); do
+            UPDATE_STATUS="$(aws eks describe-update \
+              --region "${AWS_REGION}" \
+              --name "${CLUSTER_NAME}" \
+              --update-id "${UPDATE_ID}" \
+              --query 'update.status' \
+              --output text)"
+            case "${UPDATE_STATUS}" in
+              Successful) break ;;
+              Failed|Cancelled)
+                aws eks describe-update \
+                  --region "${AWS_REGION}" \
+                  --name "${CLUSTER_NAME}" \
+                  --update-id "${UPDATE_ID}" \
+                  --query 'update.errors' \
+                  --output json >&2
+                exit 1
+                ;;
+            esac
+            if (( attempt == 60 )); then
+              echo "La restauración de los CIDR originales no terminó en diez minutos." >&2
+              exit 1
+            fi
+            sleep 10
+          done
