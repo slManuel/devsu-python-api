@@ -148,6 +148,13 @@ jobs:
       - name: Obtener el código
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Obtener los manifiestos de infraestructura
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: slManuel/devsu-aws-infrastructure
+          ref: main
+          path: infrastructure
+
       - name: Obtener credenciales temporales de AWS con OIDC
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -174,75 +181,7 @@ jobs:
         id: eks_runner_access
         env:
           CLUSTER_NAME: devsu-dev-cluster
-        run: |
-          RUNNER_IP="$(curl --fail --silent --show-error --ipv4 https://checkip.amazonaws.com | tr -d '[:space:]')"
-          python -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "${RUNNER_IP}"
-          RUNNER_CIDR="${RUNNER_IP}/32"
-          echo "runner_cidr=${RUNNER_CIDR}" >> "${GITHUB_OUTPUT}"
-
-          CURRENT_CONFIG="$(aws eks describe-cluster \
-            --region "${AWS_REGION}" \
-            --name "${CLUSTER_NAME}" \
-            --query 'cluster.resourcesVpcConfig' \
-            --output json)"
-          CURRENT_CIDRS="$(jq -c '.publicAccessCidrs' <<< "${CURRENT_CONFIG}")"
-
-          if jq --exit-status --arg cidr "${RUNNER_CIDR}" 'index($cidr) != null' \
-            <<< "${CURRENT_CIDRS}" >/dev/null; then
-            echo "changed=false" >> "${GITHUB_OUTPUT}"
-            echo "La IP del runner ya estaba autorizada; no se cambiará la lista."
-            exit 0
-          fi
-
-          CIDR_COUNT="$(jq 'length' <<< "${CURRENT_CIDRS}")"
-          if (( CIDR_COUNT >= 40 )); then
-            echo "El límite de 40 CIDR públicos de EKS impediría agregar el runner." >&2
-            exit 1
-          fi
-
-          UPDATED_CIDRS="$(jq -c --arg cidr "${RUNNER_CIDR}" '. + [$cidr]' <<< "${CURRENT_CIDRS}")"
-          PUBLIC_ACCESS="$(jq -c '.endpointPublicAccess' <<< "${CURRENT_CONFIG}")"
-          PRIVATE_ACCESS="$(jq -c '.endpointPrivateAccess' <<< "${CURRENT_CONFIG}")"
-          UPDATE_CONFIG="$(jq -cn \
-            --argjson public "${PUBLIC_ACCESS}" \
-            --argjson private "${PRIVATE_ACCESS}" \
-            --argjson cidrs "${UPDATED_CIDRS}" \
-            '{endpointPublicAccess:$public,endpointPrivateAccess:$private,publicAccessCidrs:$cidrs}')"
-
-          # Marcar el cambio antes de solicitarlo para que el paso final intente limpiar
-          # incluso si AWS devuelve un error después de aceptar la operación.
-          echo "changed=true" >> "${GITHUB_OUTPUT}"
-          UPDATE_ID="$(aws eks update-cluster-config \
-            --region "${AWS_REGION}" \
-            --name "${CLUSTER_NAME}" \
-            --resources-vpc-config "${UPDATE_CONFIG}" \
-            --query 'update.id' \
-            --output text)"
-          for attempt in $(seq 1 60); do
-            UPDATE_STATUS="$(aws eks describe-update \
-              --region "${AWS_REGION}" \
-              --name "${CLUSTER_NAME}" \
-              --update-id "${UPDATE_ID}" \
-              --query 'update.status' \
-              --output text)"
-            case "${UPDATE_STATUS}" in
-              Successful) break ;;
-              Failed|Cancelled)
-                aws eks describe-update \
-                  --region "${AWS_REGION}" \
-                  --name "${CLUSTER_NAME}" \
-                  --update-id "${UPDATE_ID}" \
-                  --query 'update.errors' \
-                  --output json >&2
-                exit 1
-                ;;
-            esac
-            if (( attempt == 60 )); then
-              echo "La autorización temporal del runner no terminó en diez minutos." >&2
-              exit 1
-            fi
-            sleep 10
-          done
+        run: bash infrastructure/ci/scripts/manage-eks-runner-cidr.sh add "${CLUSTER_NAME}" "${AWS_REGION}"
 
       - name: Conectar con el clúster EKS
         run: |
@@ -261,19 +200,19 @@ jobs:
           ECR_REPOSITORY_URI: ${{ vars.ECR_REPOSITORY_URI }}
         run: |
           IMAGE_TAG="git-${GITHUB_SHA}"
-          sed -i "s|newTag: .*|newTag: ${IMAGE_TAG}|" kubernetes/dev/kustomization.yaml
+          sed -i "s|newTag: .*|newTag: ${IMAGE_TAG}|" infrastructure/kubernetes/dev/kustomization.yaml
           echo "IMAGE=${ECR_REPOSITORY_URI}:${IMAGE_TAG}" >> "${GITHUB_ENV}"
           echo "JOB_NAME=devsu-api-migrate-${GITHUB_SHA::12}" >> "${GITHUB_ENV}"
 
       - name: Aplicar configuración no sensible
-        run: kubectl apply --filename kubernetes/dev/configmap.yaml
+        run: kubectl apply --filename infrastructure/kubernetes/dev/configmap.yaml
 
       - name: Migrar la base de datos
         run: |
           sed \
             -e "s|__JOB_NAME__|${JOB_NAME}|g" \
             -e "s|__IMAGE__|${IMAGE}|g" \
-            kubernetes/dev/migration-job.yaml \
+            infrastructure/kubernetes/dev/migration-job.yaml \
             | kubectl apply --filename -
           kubectl wait \
             --for=condition=complete \
@@ -284,7 +223,7 @@ jobs:
 
       - name: Aplicar recursos de la API y esperar el rollout
         run: |
-          kubectl apply --kustomize kubernetes/dev
+          kubectl apply --kustomize infrastructure/kubernetes/dev
           kubectl rollout status deployment/devsu-api \
             --namespace devsu \
             --timeout=240s
@@ -317,61 +256,4 @@ jobs:
         env:
           CLUSTER_NAME: devsu-dev-cluster
           RUNNER_CIDR: ${{ steps.eks_runner_access.outputs.runner_cidr }}
-        run: |
-          CURRENT_CONFIG="$(aws eks describe-cluster \
-            --region "${AWS_REGION}" \
-            --name "${CLUSTER_NAME}" \
-            --query 'cluster.resourcesVpcConfig' \
-            --output json)"
-          CURRENT_CIDRS="$(jq -c '.publicAccessCidrs' <<< "${CURRENT_CONFIG}")"
-          if ! jq --exit-status --arg cidr "${RUNNER_CIDR}" 'index($cidr) != null' \
-            <<< "${CURRENT_CIDRS}" >/dev/null; then
-            echo "La IP temporal ya no está autorizada; no se requiere limpieza."
-            exit 0
-          fi
-          RESTORED_CIDRS="$(jq -c --arg cidr "${RUNNER_CIDR}" '[.[] | select(. != $cidr)]' <<< "${CURRENT_CIDRS}")"
-
-          if [[ "${RESTORED_CIDRS}" == "[]" ]]; then
-            echo "Se cancela la limpieza: dejar el endpoint sin CIDR autorizado lo bloquearía." >&2
-            exit 1
-          fi
-
-          PUBLIC_ACCESS="$(jq -c '.endpointPublicAccess' <<< "${CURRENT_CONFIG}")"
-          PRIVATE_ACCESS="$(jq -c '.endpointPrivateAccess' <<< "${CURRENT_CONFIG}")"
-          UPDATE_CONFIG="$(jq -cn \
-            --argjson public "${PUBLIC_ACCESS}" \
-            --argjson private "${PRIVATE_ACCESS}" \
-            --argjson cidrs "${RESTORED_CIDRS}" \
-            '{endpointPublicAccess:$public,endpointPrivateAccess:$private,publicAccessCidrs:$cidrs}')"
-
-          UPDATE_ID="$(aws eks update-cluster-config \
-            --region "${AWS_REGION}" \
-            --name "${CLUSTER_NAME}" \
-            --resources-vpc-config "${UPDATE_CONFIG}" \
-            --query 'update.id' \
-            --output text)"
-          for attempt in $(seq 1 60); do
-            UPDATE_STATUS="$(aws eks describe-update \
-              --region "${AWS_REGION}" \
-              --name "${CLUSTER_NAME}" \
-              --update-id "${UPDATE_ID}" \
-              --query 'update.status' \
-              --output text)"
-            case "${UPDATE_STATUS}" in
-              Successful) break ;;
-              Failed|Cancelled)
-                aws eks describe-update \
-                  --region "${AWS_REGION}" \
-                  --name "${CLUSTER_NAME}" \
-                  --update-id "${UPDATE_ID}" \
-                  --query 'update.errors' \
-                  --output json >&2
-                exit 1
-                ;;
-            esac
-            if (( attempt == 60 )); then
-              echo "La restauración de los CIDR originales no terminó en diez minutos." >&2
-              exit 1
-            fi
-            sleep 10
-          done
+        run: bash infrastructure/ci/scripts/manage-eks-runner-cidr.sh remove "${CLUSTER_NAME}" "${AWS_REGION}" "${RUNNER_CIDR}"
